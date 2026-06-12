@@ -6,10 +6,11 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
-import { resolveStateDir } from "./state.mjs";
+import { resolveStateDir, withStateLock } from "./state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
 export const LOG_FILE_ENV = "CODEX_COMPANION_APP_SERVER_LOG_FILE";
+const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 const BROKER_STATE_FILE = "broker.json";
 
 export function createBrokerSessionDir(prefix = "cxc-") {
@@ -73,7 +74,19 @@ function resolveBrokerStateFile(cwd) {
   return path.join(resolveStateDir(cwd), BROKER_STATE_FILE);
 }
 
-export function loadBrokerSession(cwd) {
+function atomicWriteJson(filePath, payload) {
+  const tmpFile = `${filePath}.tmp.${process.pid}.${Math.random().toString(36).slice(2)}`;
+  try {
+    fs.writeFileSync(tmpFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+    fs.renameSync(tmpFile, filePath);
+  } finally {
+    if (fs.existsSync(tmpFile)) {
+      fs.unlinkSync(tmpFile);
+    }
+  }
+}
+
+function readBrokerSessionFile(cwd) {
   const stateFile = resolveBrokerStateFile(cwd);
   if (!fs.existsSync(stateFile)) {
     return null;
@@ -86,17 +99,101 @@ export function loadBrokerSession(cwd) {
   }
 }
 
+function currentSessionId(env = process.env) {
+  const sessionId = env?.[SESSION_ID_ENV]?.trim();
+  return sessionId || null;
+}
+
+function normalizeSessionIds(session) {
+  return Array.isArray(session?.sessions)
+    ? [...new Set(session.sessions.filter((value) => typeof value === "string" && value.trim()).map((value) => value.trim()))]
+    : [];
+}
+
+function addSessionRef(session, sessionId) {
+  if (!sessionId) {
+    return session;
+  }
+  return {
+    ...session,
+    sessions: [...new Set([...normalizeSessionIds(session), sessionId])]
+  };
+}
+
+export function loadBrokerSession(cwd) {
+  return readBrokerSessionFile(cwd);
+}
+
 export function saveBrokerSession(cwd, session) {
   const stateDir = resolveStateDir(cwd);
-  fs.mkdirSync(stateDir, { recursive: true });
-  fs.writeFileSync(resolveBrokerStateFile(cwd), `${JSON.stringify(session, null, 2)}\n`, "utf8");
+  withStateLock(cwd, () => {
+    fs.mkdirSync(stateDir, { recursive: true });
+    atomicWriteJson(resolveBrokerStateFile(cwd), session);
+  });
 }
 
 export function clearBrokerSession(cwd) {
+  withStateLock(cwd, () => {
+    const stateFile = resolveBrokerStateFile(cwd);
+    if (fs.existsSync(stateFile)) {
+      fs.unlinkSync(stateFile);
+    }
+  });
+}
+
+function saveBrokerSessionUnlocked(cwd, session) {
+  atomicWriteJson(resolveBrokerStateFile(cwd), session);
+}
+
+function clearBrokerSessionUnlocked(cwd) {
   const stateFile = resolveBrokerStateFile(cwd);
   if (fs.existsSync(stateFile)) {
     fs.unlinkSync(stateFile);
   }
+}
+
+export function joinBrokerSession(cwd, session, env = process.env) {
+  const sessionId = currentSessionId(env);
+  if (!sessionId) {
+    return session;
+  }
+
+  return withStateLock(cwd, () => {
+    const latest = readBrokerSessionFile(cwd) ?? session;
+    const next = addSessionRef(latest, sessionId);
+    saveBrokerSessionUnlocked(cwd, next);
+    return next;
+  });
+}
+
+export function releaseBrokerSession(cwd, sessionId) {
+  return withStateLock(cwd, () => {
+    const session = readBrokerSessionFile(cwd);
+    if (!session) {
+      return { session: null, shouldTeardown: false };
+    }
+
+    if (!sessionId) {
+      clearBrokerSessionUnlocked(cwd);
+      return { session, shouldTeardown: true };
+    }
+
+    const sessions = normalizeSessionIds(session);
+    if (sessions.length === 0) {
+      clearBrokerSessionUnlocked(cwd);
+      return { session, shouldTeardown: true };
+    }
+
+    const remainingSessions = sessions.filter((value) => value !== sessionId);
+    if (remainingSessions.length > 0) {
+      const next = { ...session, sessions: remainingSessions };
+      saveBrokerSessionUnlocked(cwd, next);
+      return { session: next, shouldTeardown: false };
+    }
+
+    clearBrokerSessionUnlocked(cwd);
+    return { session, shouldTeardown: true };
+  });
 }
 
 async function isBrokerEndpointReady(endpoint) {
@@ -113,7 +210,7 @@ async function isBrokerEndpointReady(endpoint) {
 export async function ensureBrokerSession(cwd, options = {}) {
   const existing = loadBrokerSession(cwd);
   if (existing && (await isBrokerEndpointReady(existing.endpoint))) {
-    return existing;
+    return joinBrokerSession(cwd, existing, options.env);
   }
 
   if (existing) {
@@ -164,7 +261,8 @@ export async function ensureBrokerSession(cwd, options = {}) {
     pidFile,
     logFile,
     sessionDir,
-    pid: child.pid ?? null
+    pid: child.pid ?? null,
+    ...addSessionRef({}, currentSessionId(options.env ?? process.env))
   };
   saveBrokerSession(cwd, session);
   return session;

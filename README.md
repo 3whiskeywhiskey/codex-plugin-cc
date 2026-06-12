@@ -145,7 +145,7 @@ Examples:
 /codex:rescue investigate why the tests started failing
 /codex:rescue fix the failing test with the smallest safe patch
 /codex:rescue --resume apply the top fix from the last run
-/codex:rescue --model gpt-5.4-mini --effort medium investigate the flaky integration test
+/codex:rescue --model gpt-5.5-mini --effort medium investigate the flaky integration test
 /codex:rescue --model spark fix the issue quickly
 /codex:rescue --background investigate the regression
 ```
@@ -255,10 +255,10 @@ The Codex plugin wraps the [Codex app server](https://developers.openai.com/code
 
 ### Common Configurations
 
-If you want to change the default reasoning effort or the default model that gets used by the plugin, you can define that inside your user-level or project-level `config.toml`. For example to always use `gpt-5.4-mini` on `high` for a specific project you can add the following to a `.codex/config.toml` file at the root of the directory you started Claude in:
+If you want to change the default reasoning effort or the default model that gets used by the plugin, you can define that inside your user-level or project-level `config.toml`. For example to always use `gpt-5.5-mini` on `high` for a specific project you can add the following to a `.codex/config.toml` file at the root of the directory you started Claude in:
 
 ```toml
-model = "gpt-5.4-mini"
+model = "gpt-5.5-mini"
 model_reasoning_effort = "high"
 ```
 
@@ -275,6 +275,14 @@ Check out the Codex docs for more [configuration options](https://developers.ope
 Delegated tasks and any [stop gate](#what-does-the-review-gate-do) run can also be directly resumed inside Codex by running `codex resume` either with the specific session ID you received from running `/codex:result` or `/codex:status` or by selecting it from the list.
 
 This way you can review the Codex work or continue the work there.
+
+### Parallel And Orchestrated Use
+
+For parallel agents, run each worker in its own git worktree when possible. The plugin keys job state and the shared app-server broker by worktree, so separate worktrees avoid cross-agent ledger and broker contention.
+
+For non-git sandboxes or workers that must share the same checkout path, set a distinct `CODEX_COMPANION_ISOLATION_KEY` per worker. Set a distinct `CODEX_COMPANION_SESSION_ID` per worker as well so `/codex:status`, `/codex:result`, and `/codex:cancel` remain session-scoped.
+
+If you want multiple Claude sessions in the same worktree to be fully isolated, set `CODEX_COMPANION_ISOLATION=session`. This folds `CODEX_COMPANION_SESSION_ID` into the state and broker key.
 
 ## FAQ
 
